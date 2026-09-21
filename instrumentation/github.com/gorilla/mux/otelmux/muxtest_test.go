@@ -4,11 +4,14 @@
 package otelmux_test
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/stretchr/testify/assert"
@@ -20,6 +23,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	otelsemconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 	"go.opentelemetry.io/otel/trace"
 
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gorilla/mux/otelmux"
@@ -224,6 +228,230 @@ func TestNotFoundIsNotError(t *testing.T) {
 		attribute.String("http.route", "/does/not/exist"),
 	)
 	assert.Equal(t, codes.Unset, sr.Ended()[0].Status().Code)
+}
+
+func TestSpanStatus(t *testing.T) {
+	testCases := []struct {
+		httpStatusCode int
+		wantSpanStatus codes.Code
+		wantErrorType  string
+	}{
+		{http.StatusOK, codes.Unset, ""},
+		{http.StatusBadRequest, codes.Unset, ""},
+		{http.StatusInternalServerError, codes.Error, "500"},
+	}
+	for _, tc := range testCases {
+		t.Run(strconv.Itoa(tc.httpStatusCode), func(t *testing.T) {
+			sr := tracetest.NewSpanRecorder()
+			provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+			router := mux.NewRouter()
+			router.Use(otelmux.Middleware("foobar", otelmux.WithTracerProvider(provider)))
+			router.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.httpStatusCode)
+			})
+
+			router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", http.NoBody))
+
+			require.Len(t, sr.Ended(), 1, "should emit a span")
+			assert.Equal(t, tc.wantSpanStatus, sr.Ended()[0].Status().Code, "should only set Error status for HTTP statuses >= 500")
+
+			if tc.wantErrorType != "" {
+				assert.Contains(t, sr.Ended()[0].Attributes(), attribute.String("error.type", tc.wantErrorType))
+			} else {
+				for _, attr := range sr.Ended()[0].Attributes() {
+					assert.NotEqual(t, attribute.Key("error.type"), attr.Key)
+				}
+			}
+		})
+	}
+}
+
+func waitOrFail(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+	}
+}
+
+func assertServerMetricErrorType(t *testing.T, reader *sdkmetric.ManualReader, want attribute.KeyValue) {
+	t.Helper()
+
+	rm := metricdata.ResourceMetrics{}
+	require.NoError(t, reader.Collect(t.Context(), &rm))
+	require.Len(t, rm.ScopeMetrics, 1)
+
+	findMetric := func(name string) *metricdata.Metrics {
+		for i, m := range rm.ScopeMetrics[0].Metrics {
+			if m.Name == name {
+				return &rm.ScopeMetrics[0].Metrics[i]
+			}
+		}
+		return nil
+	}
+
+	assertErrorType := func(attrs attribute.Set, name string) {
+		errorType, ok := attrs.Value(otelsemconv.ErrorTypeKey)
+		require.True(t, ok, "expected error.type attribute on the %s metric", name)
+		assert.Equal(t, want.Value.AsString(), errorType.AsString())
+	}
+
+	durationMetric := findMetric("http.server.request.duration")
+	require.NotNil(t, durationMetric, "expected to find the http.server.request.duration metric")
+	durationHistogram, ok := durationMetric.Data.(metricdata.Histogram[float64])
+	require.True(t, ok)
+	require.Len(t, durationHistogram.DataPoints, 1)
+	assertErrorType(durationHistogram.DataPoints[0].Attributes, "http.server.request.duration")
+
+	for _, name := range []string{"http.server.request.body.size", "http.server.response.body.size"} {
+		metric := findMetric(name)
+		require.NotNil(t, metric, "expected to find the %s metric", name)
+		histogram, ok := metric.Data.(metricdata.Histogram[int64])
+		require.True(t, ok)
+		require.Len(t, histogram.DataPoints, 1)
+		assertErrorType(histogram.DataPoints[0].Attributes, name)
+	}
+}
+
+// TestClientDisconnect reproduces a real HTTP/1.1 client disconnect: the
+// handler observes the cancelled request context and writes a 500, mirroring
+// how a genuine server fault would look. The span and metrics must carry
+// error.type so the disconnect is distinguishable from a real server error.
+func TestClientDisconnect(t *testing.T) {
+	sr := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+
+	reader := sdkmetric.NewManualReader()
+	meterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+
+	handlerStarted := make(chan struct{})
+	router := mux.NewRouter()
+	router.Use(otelmux.Middleware(
+		"foobar",
+		otelmux.WithTracerProvider(provider),
+		otelmux.WithMeterProvider(meterProvider),
+	))
+	router.HandleFunc("/hello", func(w http.ResponseWriter, r *http.Request) {
+		close(handlerStarted)
+		<-r.Context().Done()
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("cancelled"))
+	})
+
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	reqCtx, cancel := context.WithCancel(t.Context())
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, srv.URL+"/hello", http.NoBody)
+	require.NoError(t, err)
+
+	requestDone := make(chan struct{})
+	go func() {
+		defer close(requestDone)
+		resp, doErr := srv.Client().Do(req)
+		if doErr == nil {
+			_ = resp.Body.Close()
+		}
+	}()
+
+	waitOrFail(t, handlerStarted, "the handler to start")
+	cancel()
+	waitOrFail(t, requestDone, "the request to finish")
+
+	require.Eventually(t, func() bool {
+		return len(sr.Ended()) == 1
+	}, time.Second, 10*time.Millisecond, "handler should finish and end the span after the client disconnects")
+
+	span := sr.Ended()[0]
+	assert.Equal(t, codes.Error, span.Status().Code)
+	assert.Contains(t, span.Attributes(), attribute.Int("http.response.status_code", http.StatusInternalServerError))
+	assert.Contains(t, span.Attributes(), otelsemconv.ErrorType(context.Canceled))
+
+	assertServerMetricErrorType(t, reader, otelsemconv.ErrorType(context.Canceled))
+}
+
+// TestClientDisconnectWithoutErrorStatus reproduces a client disconnect
+// where the handler observes the cancelled request context and returns
+// without writing an error response. Per the HTTP semantic conventions,
+// span status must still be Error because a detected error exists, even
+// though http.response.status_code stays at the wrapper default of 200.
+func TestClientDisconnectWithoutErrorStatus(t *testing.T) {
+	sr := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+
+	reader := sdkmetric.NewManualReader()
+	meterProvider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+
+	handlerStarted := make(chan struct{})
+	router := mux.NewRouter()
+	router.Use(otelmux.Middleware(
+		"foobar",
+		otelmux.WithTracerProvider(provider),
+		otelmux.WithMeterProvider(meterProvider),
+	))
+	router.HandleFunc("/hello", func(_ http.ResponseWriter, r *http.Request) {
+		close(handlerStarted)
+		<-r.Context().Done()
+	})
+
+	srv := httptest.NewServer(router)
+	defer srv.Close()
+
+	reqCtx, cancel := context.WithCancel(t.Context())
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, srv.URL+"/hello", http.NoBody)
+	require.NoError(t, err)
+
+	requestDone := make(chan struct{})
+	go func() {
+		defer close(requestDone)
+		resp, doErr := srv.Client().Do(req)
+		if doErr == nil {
+			_ = resp.Body.Close()
+		}
+	}()
+
+	waitOrFail(t, handlerStarted, "the handler to start")
+	cancel()
+	waitOrFail(t, requestDone, "the request to finish")
+
+	require.Eventually(t, func() bool {
+		return len(sr.Ended()) == 1
+	}, time.Second, 10*time.Millisecond, "handler should finish and end the span after the client disconnects")
+
+	span := sr.Ended()[0]
+	assert.Equal(t, codes.Error, span.Status().Code, "span status must be Error when the request context carries a detected error")
+	assert.Contains(t, span.Attributes(), attribute.Int("http.response.status_code", http.StatusOK), "the selected response status code should be preserved")
+	assert.Contains(t, span.Attributes(), otelsemconv.ErrorType(context.Canceled))
+
+	assertServerMetricErrorType(t, reader, otelsemconv.ErrorType(context.Canceled))
+}
+
+func TestDownstreamContextCancellationIgnored(t *testing.T) {
+	sr := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+
+	router := mux.NewRouter()
+	router.Use(otelmux.Middleware("foobar", otelmux.WithTracerProvider(provider)))
+	router.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Create and immediately cancel a scoped child context — this must
+		// not affect the middleware's own context.
+		_, cancel := context.WithCancel(r.Context())
+		cancel()
+		w.WriteHeader(http.StatusOK)
+	})
+
+	router.ServeHTTP(
+		httptest.NewRecorder(),
+		httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", http.NoBody),
+	)
+
+	require.Len(t, sr.Ended(), 1)
+	span := sr.Ended()[0]
+	assert.Equal(t, codes.Unset, span.Status().Code)
+	for _, attr := range span.Attributes() {
+		assert.NotEqual(t, otelsemconv.ErrorTypeKey, attr.Key)
+	}
 }
 
 func assertSpan(t *testing.T, span sdktrace.ReadOnlySpan, name string, kind trace.SpanKind, attrs ...attribute.KeyValue) {

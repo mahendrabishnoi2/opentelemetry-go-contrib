@@ -6,14 +6,17 @@ package otelmux
 import (
 	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/felixge/httpsnoop"
 	"github.com/gorilla/mux"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/propagation"
+	otelsemconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 	"go.opentelemetry.io/otel/trace"
 
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gorilla/mux/otelmux/internal/request"
@@ -188,7 +191,25 @@ func (tw traceware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r.MultipartForm = rCtx.MultipartForm
 	}
 	statusCode := rww.StatusCode()
-	span.SetStatus(tw.semconv.Status(statusCode))
+
+	// Prefer the middleware's own context error over the handler-visible
+	// request context. A handler may replace the request with one wrapping
+	// a differently-scoped child whose Err() reflects that handler's
+	// lifecycle rather than an actual client disconnect.
+	var errorTypeAttr attribute.KeyValue
+	if err := ctx.Err(); err != nil {
+		span.SetStatus(codes.Error, err.Error())
+		errorTypeAttr = otelsemconv.ErrorType(err)
+		span.SetAttributes(errorTypeAttr)
+	} else {
+		stCode, stMsg := tw.semconv.Status(statusCode)
+		span.SetStatus(stCode, stMsg)
+		if statusCode >= 500 && statusCode < 600 {
+			errorTypeAttr = otelsemconv.ErrorTypeKey.String(strconv.Itoa(statusCode))
+			span.SetAttributes(errorTypeAttr)
+		}
+	}
+
 	span.SetAttributes(tw.semconv.ResponseTraceAttrs(semconv.ResponseTelemetry{
 		StatusCode: statusCode,
 		ReadBytes:  bw.BytesRead(),
@@ -197,11 +218,18 @@ func (tw traceware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		WriteError: rww.Error(),
 	})...)
 
+	// errorTypeAttr is prepended so a caller-supplied error.type from
+	// MetricAttributesFn takes precedence, matching last-write-wins.
+	additionalAttributes := tw.metricAttributesFromRequest(r)
+	if errorTypeAttr.Valid() {
+		additionalAttributes = append([]attribute.KeyValue{errorTypeAttr}, additionalAttributes...)
+	}
+
 	metricAttributes := semconv.MetricAttributes{
 		Req:                  r,
 		StatusCode:           statusCode,
 		Route:                routeStr,
-		AdditionalAttributes: tw.metricAttributesFromRequest(r),
+		AdditionalAttributes: additionalAttributes,
 	}
 
 	tw.semconv.RecordMetrics(ctx, semconv.ServerMetricData{
